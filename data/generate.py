@@ -7,16 +7,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
 # 1. Configuration — every number here is an assumption you can explain
-# ---------------------------------------------------------------------------
 
 START = pd.Timestamp("2025-10-01")
 END = pd.Timestamp("2026-09-30")  # inclusive: 365 days of history
 
-# (wilaya, share of customers, network quality 0..1)
-# Network quality is INVENTED for this fictional operator; it only drives
-# dropped calls and churn risk. Big northern cities get better coverage.
 WILAYAS = [
     ("Alger", 0.20, 0.95), ("Oran", 0.11, 0.92), ("Constantine", 0.08, 0.90),
     ("Sétif", 0.08, 0.88), ("Batna", 0.07, 0.85), ("Blida", 0.06, 0.92),
@@ -26,13 +21,7 @@ WILAYAS = [
 ]
 
 # Hidden behaviour segments.
-#   data_mb / minutes / sms : typical value on a day the customer is active
-#   use_prob                : chance of using the network on a given day
-#   recharge_every          : average days between top-ups
-#   amounts                 : top-up amounts (DZD) and their probabilities
-#   offer_prob              : chance a top-up is (partly) spent on a bundle
-#   base_churn              : chance of leaving during the 12 months, before
-#                             hidden satisfaction / network effects
+
 SEGMENTS = {
     "heavy_data": dict(share=0.20, plan="DzMobile Data", age=["18-24", "25-34", "35-44"],
                        age_p=[0.35, 0.45, 0.20], data_mb=1100, minutes=8, sms=0.4,
@@ -76,7 +65,7 @@ OFFERS = pd.DataFrame(
              "validity_days", "night_only", "target_segment"],
 )
 
-# Which offers each segment prefers (weights over offer_id 1..8).
+# Which offers each segment prefers 
 OFFER_PREFS = {
     "heavy_data": [0.02, 0.03, 0.00, 0.05, 0.10, 0.40, 0.20, 0.20],
     "student":    [0.35, 0.35, 0.02, 0.18, 0.08, 0.02, 0.00, 0.00],
@@ -94,13 +83,18 @@ CHANNEL_PREFS = {
     "occasional": [0.55, 0.40, 0.04, 0.01],
 }
 
-# Approximate Ramadan 2026 window (data use rises in the evenings and at night).
+
+GRADUAL_CHURN_SHARE = 0.50  
+DRIFT_DEPTH = 0.60         
+DIP_SHARE = 0.25        
+DIP_LEVEL = 0.45            
+WANDER_SD = 0.40           
+
+# Approximate Ramadan 2026 window 
 RAMADAN = (pd.Timestamp("2026-02-18"), pd.Timestamp("2026-03-19"))
 
 
-# ---------------------------------------------------------------------------
 # 2. Small helpers
-# ---------------------------------------------------------------------------
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
@@ -110,9 +104,7 @@ def logit(p):
     return np.log(p / (1.0 - p))
 
 
-# ---------------------------------------------------------------------------
 # 3. Subscribers and their hidden truth
-# ---------------------------------------------------------------------------
 
 def make_subscribers(n: int, rng: np.random.Generator, n_days: int):
     seg_names = list(SEGMENTS)
@@ -125,9 +117,7 @@ def make_subscribers(n: int, rng: np.random.Generator, n_days: int):
     wilaya = rng.choice(w_names, size=n, p=w_p / w_p.sum())
     quality = np.array([w_quality[w] for w in wilaya])
 
-    # 30% join during the year (this replaces the customers lost to churn and
-    # keeps the active base roughly flat, as at a real operator); the rest
-    # joined 1 month to 4 years before START.
+   
     is_new = rng.random(n) < 0.30
     signup_day = np.where(
         is_new,
@@ -152,24 +142,22 @@ def make_subscribers(n: int, rng: np.random.Generator, n_days: int):
     base = np.array([SEGMENTS[s]["base_churn"] for s in segment])
     churn_logit = (
         logit(base)
-        - 0.9 * satisfaction                     # unhappy customers leave
-        + 0.5 * (tenure_at_start < 180)          # new customers are less loyal
-        + rng.normal(0, 0.5, size=n)             # pure luck
+        - 0.9 * satisfaction                   
+        + 0.5 * (tenure_at_start < 180)         
+        + rng.normal(0, 0.5, size=n)            
     )
     churns = rng.random(n) < sigmoid(churn_logit)
 
-    # When do they stop? At least 21 days after signup, inside the window.
     first_day = np.maximum(signup_day, 0)
-    churn_day = np.full(n, n_days + 1000)  # "never" for non-churners
+    churn_day = np.full(n, n_days + 1000)  
     lo = np.minimum(first_day + 21, n_days - 1)
     churn_day[churns] = rng.integers(lo[churns], n_days)
 
-    # 70% fade gradually over 3–10 weeks, 30% leave abruptly (≤3 days).
-    gradual = rng.random(n) < 0.70
+    gradual = rng.random(n) < GRADUAL_CHURN_SHARE
     drift_len = np.where(gradual, rng.integers(21, 71, size=n), rng.integers(0, 4, size=n))
 
-    # 12% of everyone has a temporary dip (travel, money trouble) and recovers.
-    has_dip = rng.random(n) < 0.12
+    # Some customers have a temporary dip.
+    has_dip = rng.random(n) < DIP_SHARE
     dip_start = rng.integers(0, n_days - 40, size=n)
     dip_len = rng.integers(14, 41, size=n)
 
@@ -205,38 +193,52 @@ def make_subscribers(n: int, rng: np.random.Generator, n_days: int):
     return subscribers, truth, hidden
 
 
-# ---------------------------------------------------------------------------
-# 4. Daily activity level: a (subscribers × days) matrix between 0 and 1
-# ---------------------------------------------------------------------------
+# 4. Daily activity level
 
-def activity_matrix(h: dict, n_days: int) -> np.ndarray:
+def life_wander(n: int, n_days: int, rng: np.random.Generator) -> np.ndarray:
+    
+    if WANDER_SD == 0:
+        return np.ones((n, n_days))
+    n_knots = n_days // 30 + 2
+    steps = rng.normal(0, WANDER_SD, size=(n, n_knots))
+    walk = np.zeros((n, n_knots))
+    for k in range(1, n_knots):
+        walk[:, k] = 0.7 * walk[:, k - 1] + steps[:, k]  
+    knot_days = np.arange(n_knots) * 30
+    days = np.arange(n_days)
+    daily = np.stack([np.interp(days, knot_days, row) for row in walk])
+    return np.clip(np.exp(daily), 0.35, 1.8)
+
+
+def activity_matrix(h: dict, n_days: int, rng: np.random.Generator) -> np.ndarray:
     days = np.arange(n_days)[None, :]                    # shape (1, D)
     signup = np.maximum(h["signup_day"], 0)[:, None]     # shape (N, 1)
     churn = h["churn_day"][:, None]
     drift = h["drift_len"][:, None]
 
     act = np.ones((len(signup), n_days))
-    act[days < signup] = 0.0                              # not a customer yet
+    act[days < signup] = 0.0                              
 
-    # Fading before churn: linear from 1 down to 0.15 over the drift window.
+    # Fading before churn
     drift_start = churn - drift
     in_drift = (days >= drift_start) & (days < churn)
     progress = np.clip((days - drift_start) / np.maximum(drift, 1), 0, 1)
-    act = np.where(in_drift, act * (1 - 0.85 * progress), act)
+    act = np.where(in_drift, act * (1 - DRIFT_DEPTH * progress), act)
 
-    act[days >= churn] = 0.0                              # gone
+    act[days >= churn] = 0.0                              
 
-    # Temporary dips that recover (false alarms for the model).
+    # Temporary dips that recover 
     dip_s = h["dip_start"][:, None]
     dip_e = dip_s + h["dip_len"][:, None]
     in_dip = h["has_dip"][:, None] & (days >= dip_s) & (days < dip_e)
-    act = np.where(in_dip, act * 0.3, act)
+    act = np.where(in_dip, act * DIP_LEVEL, act)
+
+    # Everyone's normal life ups and downs 
+    act = act * life_wander(len(signup), n_days, rng)
     return act
 
 
-# ---------------------------------------------------------------------------
 # 5. Daily usage
-# ---------------------------------------------------------------------------
 
 def make_daily_usage(h: dict, act: np.ndarray, rng: np.random.Generator) -> pd.DataFrame:
     n, n_days = act.shape
@@ -246,7 +248,7 @@ def make_daily_usage(h: dict, act: np.ndarray, rng: np.random.Generator) -> pd.D
     def seg_arr(key):
         return np.array([SEGMENTS[s][key] for s in seg])[:, None]
 
-    # Algerian weekend = Friday (4) and Saturday (5): more data, fewer calls.
+    
     weekend = np.isin(dates.dayofweek, [4, 5])[None, :]
     ramadan = ((dates >= RAMADAN[0]) & (dates <= RAMADAN[1]))[None, :]
     data_season = np.where(weekend, 1.15, 1.0) * np.where(ramadan, 1.12, 1.0)
@@ -262,13 +264,13 @@ def make_daily_usage(h: dict, act: np.ndarray, rng: np.random.Generator) -> pd.D
                * rng.gamma(2.0, 0.5, size=(n, n_days)))
     sms = rng.poisson(seg_arr("sms") * act)
 
-    # Share of data used at night, per subscriber (students stay up late).
+    # Share of data used at night, per subscriber
     a = np.array([SEGMENTS[s]["night_beta"][0] for s in seg])
     b = np.array([SEGMENTS[s]["night_beta"][1] for s in seg])
     night_share = rng.beta(a, b)[:, None] * rng.uniform(0.7, 1.3, size=(n, n_days))
     data_night = data * np.clip(night_share, 0, 1)
 
-    # Dropped calls: worse network + unhappy customers experience more of them.
+    # Dropped calls.
     drop_rate = (1 - h["quality"])[:, None] * 0.12 * np.exp(-0.25 * h["satisfaction"])[:, None]
     dropped = rng.poisson(minutes / 3.0 * drop_rate)
 
@@ -285,9 +287,8 @@ def make_daily_usage(h: dict, act: np.ndarray, rng: np.random.Generator) -> pd.D
     return usage
 
 
-# ---------------------------------------------------------------------------
+# 
 # 6. Recharges and offer purchases (event by event, per subscriber)
-# ---------------------------------------------------------------------------
 
 def make_recharges_and_subscriptions(h: dict, act: np.ndarray, rng: np.random.Generator):
     n, n_days = act.shape
@@ -303,7 +304,6 @@ def make_recharges_and_subscriptions(h: dict, act: np.ndarray, rng: np.random.Ge
         prefs = np.array(OFFER_PREFS[seg])
 
         # First top-up: on signup day for new customers, otherwise somewhere
-        # in the first recharge cycle of the window.
         t = max(h["signup_day"][i], 0)
         if h["signup_day"][i] < 0:
             t += int(rng.integers(0, max(int(mean_gap), 1) + 1))
@@ -311,7 +311,7 @@ def make_recharges_and_subscriptions(h: dict, act: np.ndarray, rng: np.random.Ge
         while t < n_days and act[i, t] > 0:
             level = act[i, t]
             amount = rng.choice(cfg["amounts"], p=cfg["amounts_p"])
-            if rng.random() < (1 - level):              # fading customers top up less
+            if rng.random() < (1 - level):           
                 amount = min(cfg["amounts"])
             channel = str(rng.choice(CHANNELS, p=CHANNEL_PREFS[seg]))
             recharge_rows.append((i + 1, t, int(amount), channel))
@@ -324,7 +324,6 @@ def make_recharges_and_subscriptions(h: dict, act: np.ndarray, rng: np.random.Ge
                     oid = int(rng.choice(offer_ids, p=w / w.sum()))
                     sub_rows.append((i + 1, oid, t, t + offer_valid[oid], offer_price[oid]))
 
-            # Next top-up: longer gaps when activity is low (renewal process).
             gap = mean_gap * rng.gamma(3.0, 1 / 3.0) / max(level, 0.12)
             t += max(1, int(round(gap)))
 
@@ -342,12 +341,10 @@ def make_recharges_and_subscriptions(h: dict, act: np.ndarray, rng: np.random.Ge
     return rech, subs
 
 
-# ---------------------------------------------------------------------------
 # 7. Summary — look at it every time you generate data
-# ---------------------------------------------------------------------------
 
 def print_summary(subscribers, truth, usage, rech, subs):
-    print("\n=== DzMobile synthetic data summary ===")
+    print("\nDzMobile synthetic data summary ")
     print(f"subscribers      : {len(subscribers):>10,}")
     print(f"daily_usage rows : {len(usage):>10,}")
     print(f"recharges        : {len(rech):>10,}")
@@ -372,9 +369,7 @@ def print_summary(subscribers, truth, usage, rech, subs):
           .value_counts().head(4).to_dict())
 
 
-# ---------------------------------------------------------------------------
 # 8. Main
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Generate DzMobile synthetic data")
@@ -383,12 +378,12 @@ def main():
     parser.add_argument("--out", type=Path, default=Path(__file__).parent / "raw")
     args = parser.parse_args()
 
-    rng = np.random.default_rng(args.seed)   # same seed = same data, always
+    rng = np.random.default_rng(args.seed)   
     n_days = (END - START).days + 1
 
     print(f"Generating {args.n_subscribers:,} subscribers over {n_days} days...")
     subscribers, truth, hidden = make_subscribers(args.n_subscribers, rng, n_days)
-    act = activity_matrix(hidden, n_days)
+    act = activity_matrix(hidden, n_days, rng)
     usage = make_daily_usage(hidden, act, rng)
     rech, subs = make_recharges_and_subscriptions(hidden, act, rng)
 
